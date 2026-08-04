@@ -8,7 +8,10 @@ import sys
 from urllib.parse import urlparse
 
 # 修改成你的 ComfyUI 路径
-COMFYUI_PATH = os.path.expanduser("~/ComfyUI")
+from pathlib import Path
+
+# 以脚本所在目录作为 ComfyUI 根目录
+COMFYUI_PATH = Path(__file__).resolve().parent
 
 MODEL_DIR_MAP = {
     "checkpoints": "models/checkpoints",
