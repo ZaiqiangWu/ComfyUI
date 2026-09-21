@@ -10,3 +10,8 @@ python -m pip install \
 
 
 
+python -m pip install -r requirements.txt
+
+
+python -m pip install -r manager_requirements.txt
+
