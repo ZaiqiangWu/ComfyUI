@@ -2,325 +2,680 @@
 
 import argparse
 import json
-import os
+import re
 import sys
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlparse
+
+
+# ------------------------------------------------------------
+# Known ComfyUI loader -> (model directory, widget index)
+# ------------------------------------------------------------
+
+LOADERS = {
+    "VAELoader": ("vae", 0),
+    "UNETLoader": ("diffusion_models", 0),
+    "CLIPLoader": ("text_encoders", 0),
+    "UpscaleModelLoader": ("upscale_models", 0),
+    "CheckpointLoaderSimple": ("checkpoints", 0),
+    "LoraLoader": ("loras", 0),
+
+    # This workflow
+    "UltralyticsDetectorProvider": ("ultralytics", 0),
+
+    # SeedVR2
+    "SeedVR2LoadDiTModel": ("seedvr2", 0),
+    "SeedVR2LoadVAEModel": ("seedvr2", 0),
+}
 
 
 def human_size(n):
     units = ["B", "KB", "MB", "GB", "TB"]
-    size = float(n)
+    n = float(n)
 
     for unit in units:
-        if size < 1024 or unit == units[-1]:
-            return f"{size:.2f} {unit}"
-        size /= 1024
+        if n < 1024:
+            return f"{n:.2f} {unit}"
+        n /= 1024
+
+    return f"{n:.2f} PB"
 
 
-def find_models(obj, result=None):
+def basename(name):
     """
-    Recursively find:
+    ComfyUI may store things like:
 
-        properties: {
-            models: [
-                {
-                    name: "...",
-                    url: "...",
-                    directory: "..."
-                }
-            ]
-        }
+        ComfyUI\\Moody-Krea-Mix-v7.safetensors
 
-    Works with normal nodes and subgraph nodes.
+    Return only actual filename.
     """
+
+    return name.replace("\\", "/").split("/")[-1]
+
+
+# ------------------------------------------------------------
+# Recursively collect nodes
+# ------------------------------------------------------------
+
+def collect_nodes(obj, result=None):
 
     if result is None:
-        result = {}
+        result = []
 
     if isinstance(obj, dict):
 
-        properties = obj.get("properties")
+        # Looks like a workflow node
+        if (
+            "type" in obj
+            and "widgets_values" in obj
+            and isinstance(obj.get("type"), str)
+        ):
+            result.append(obj)
 
-        if isinstance(properties, dict):
-            models = properties.get("models")
-
-            if isinstance(models, list):
-                for model in models:
-
-                    if not isinstance(model, dict):
-                        continue
-
-                    name = model.get("name")
-                    url = model.get("url")
-                    directory = model.get("directory")
-
-                    if not name or not url:
-                        continue
-
-                    # Avoid duplicates
-                    key = (directory or "", name)
-
-                    result[key] = {
-                        "name": name,
-                        "url": url,
-                        "directory": directory or "",
-                        "hash": model.get("hash"),
-                        "hash_type": model.get("hash_type"),
-                    }
-
-        # Recursively scan everything, including definitions/subgraphs
         for value in obj.values():
-            find_models(value, result)
+            collect_nodes(value, result)
 
     elif isinstance(obj, list):
-        for item in obj:
-            find_models(item, result)
+
+        for value in obj:
+            collect_nodes(value, result)
 
     return result
 
 
+# ------------------------------------------------------------
+# Extract actual selected models
+# ------------------------------------------------------------
+
+def extract_required_models(workflow):
+
+    nodes = collect_nodes(workflow)
+
+    models = {}
+
+    for node in nodes:
+
+        node_type = node.get("type")
+
+        if node_type not in LOADERS:
+            continue
+
+        directory, widget_index = LOADERS[node_type]
+
+        widgets = node.get("widgets_values", [])
+
+        if not isinstance(widgets, list):
+            continue
+
+        if len(widgets) <= widget_index:
+            continue
+
+        value = widgets[widget_index]
+
+        if not isinstance(value, str):
+            continue
+
+        if not (
+            value.lower().endswith(".safetensors")
+            or value.lower().endswith(".pth")
+            or value.lower().endswith(".pt")
+            or value.lower().endswith(".ckpt")
+            or value.lower().endswith(".bin")
+        ):
+            continue
+
+        filename = basename(value)
+
+        key = (directory, filename)
+
+        models[key] = {
+            "name": filename,
+            "original_name": value,
+            "directory": directory,
+            "node_type": node_type,
+            "node_id": node.get("id"),
+            "url": None,
+            "url_source": None,
+        }
+
+    return models
+
+
+# ------------------------------------------------------------
+# Extract properties.models metadata
+# ------------------------------------------------------------
+
+def extract_metadata_models(workflow):
+
+    result = []
+
+    def walk(obj):
+
+        if isinstance(obj, dict):
+
+            properties = obj.get("properties")
+
+            if isinstance(properties, dict):
+
+                models = properties.get("models")
+
+                if isinstance(models, list):
+
+                    for model in models:
+
+                        if not isinstance(model, dict):
+                            continue
+
+                        name = model.get("name")
+                        url = model.get("url")
+                        directory = model.get("directory")
+
+                        if name and url:
+
+                            result.append({
+                                "name": basename(name),
+                                "url": url,
+                                "directory": directory,
+                            })
+
+            for value in obj.values():
+                walk(value)
+
+        elif isinstance(obj, list):
+
+            for value in obj:
+                walk(value)
+
+    walk(workflow)
+
+    return result
+
+
+# ------------------------------------------------------------
+# Extract Markdown links
+# ------------------------------------------------------------
+
+def extract_markdown_links(workflow):
+
+    links = []
+
+    nodes = collect_nodes(workflow)
+
+    # Markdown:
+    #
+    # [filename](https://...)
+    #
+    pattern = re.compile(
+        r'\[([^\]]+)\]\((https?://[^)\s]+)\)'
+    )
+
+    for node in nodes:
+
+        if node.get("type") not in (
+            "MarkdownNote",
+            "Note",
+        ):
+            continue
+
+        widgets = node.get("widgets_values", [])
+
+        if not isinstance(widgets, list):
+            continue
+
+        for value in widgets:
+
+            if not isinstance(value, str):
+                continue
+
+            for label, url in pattern.findall(value):
+
+                links.append({
+                    "label": label.strip(),
+                    "url": url.strip(),
+                })
+
+    return links
+
+
+# ------------------------------------------------------------
+# Match URL
+# ------------------------------------------------------------
+
+def attach_urls(required, metadata, markdown_links):
+
+    for model in required.values():
+
+        filename = model["name"]
+
+        # ------------------------------------------------
+        # 1. Exact properties.models match
+        # ------------------------------------------------
+
+        for item in metadata:
+
+            if item["name"].lower() == filename.lower():
+
+                model["url"] = item["url"]
+                model["url_source"] = "properties.models"
+
+                break
+
+        if model["url"]:
+            continue
+
+        # ------------------------------------------------
+        # 2. Exact Markdown label match
+        # ------------------------------------------------
+
+        for item in markdown_links:
+
+            label = basename(item["label"])
+
+            if label.lower() == filename.lower():
+
+                model["url"] = item["url"]
+                model["url_source"] = "markdown"
+
+                break
+
+        if model["url"]:
+            continue
+
+        # ------------------------------------------------
+        # 3. URL basename match
+        # ------------------------------------------------
+
+        for item in markdown_links:
+
+            url_name = basename(
+                urlparse(item["url"]).path
+            )
+
+            if url_name.lower() == filename.lower():
+
+                model["url"] = item["url"]
+                model["url_source"] = "markdown-url"
+
+                break
+
+
+# ------------------------------------------------------------
+# Resolve ComfyUI target path
+# ------------------------------------------------------------
+
+def target_path(models_root, model):
+
+    directory = model["directory"]
+
+    original = model["original_name"].replace("\\", "/")
+
+    # Preserve subdirectory specified by node, e.g.
+    #
+    # ComfyUI\\xxx.safetensors
+    #
+    parts = original.split("/")
+
+    if len(parts) > 1:
+
+        subdir = Path(*parts[:-1])
+
+        return (
+            models_root
+            / directory
+            / subdir
+            / model["name"]
+        )
+
+    return (
+        models_root
+        / directory
+        / model["name"]
+    )
+
+
+# ------------------------------------------------------------
+# Download with resume
+# ------------------------------------------------------------
+
 def download(url, destination):
+
     destination = Path(destination)
-    destination.parent.mkdir(parents=True, exist_ok=True)
 
-    temp_path = Path(str(destination) + ".part")
+    destination.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-    # Resume if .part already exists
-    existing_size = 0
+    temp = Path(str(destination) + ".part")
 
-    if temp_path.exists():
-        existing_size = temp_path.stat().st_size
+    existing = (
+        temp.stat().st_size
+        if temp.exists()
+        else 0
+    )
 
-    headers = {}
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+    }
 
-    if existing_size > 0:
-        headers["Range"] = f"bytes={existing_size}-"
+    if existing:
+        headers["Range"] = f"bytes={existing}-"
 
     request = urllib.request.Request(
         url,
-        headers=headers
+        headers=headers,
     )
 
     print(f"URL: {url}")
     print(f"Destination: {destination}")
 
-    if existing_size:
-        print(f"Resuming from {human_size(existing_size)}")
+    if existing:
+        print(
+            f"Resuming from "
+            f"{human_size(existing)}"
+        )
 
-    try:
-        response = urllib.request.urlopen(request)
+    response = urllib.request.urlopen(request)
 
-        status = getattr(response, "status", None)
+    status = getattr(response, "status", 200)
 
-        # Server ignored Range → restart download
-        if existing_size and status == 200:
-            print("Server does not support resume. Restarting download.")
-            existing_size = 0
-            mode = "wb"
-        else:
-            mode = "ab" if existing_size else "wb"
+    if existing and status == 200:
 
-        total_header = response.headers.get("Content-Length")
+        print(
+            "Server ignored Range. "
+            "Restarting download."
+        )
 
-        if total_header:
-            total = int(total_header) + existing_size
-        else:
-            total = None
+        existing = 0
+        mode = "wb"
 
-        downloaded = existing_size
+    else:
 
-        with open(temp_path, mode) as f:
+        mode = "ab" if existing else "wb"
 
-            while True:
+    length = response.headers.get(
+        "Content-Length"
+    )
 
-                chunk = response.read(8 * 1024 * 1024)
+    total = (
+        int(length) + existing
+        if length
+        else None
+    )
 
-                if not chunk:
-                    break
+    downloaded = existing
 
-                f.write(chunk)
+    with open(temp, mode) as f:
 
-                downloaded += len(chunk)
+        while True:
 
-                if total:
-                    percent = downloaded / total * 100
+            chunk = response.read(
+                8 * 1024 * 1024
+            )
 
-                    print(
-                        f"\r"
-                        f"{human_size(downloaded)} / "
-                        f"{human_size(total)} "
-                        f"({percent:.1f}%)",
-                        end="",
-                        flush=True,
-                    )
-                else:
-                    print(
-                        f"\r{human_size(downloaded)}",
-                        end="",
-                        flush=True,
-                    )
+            if not chunk:
+                break
 
-        print()
+            f.write(chunk)
 
-        temp_path.rename(destination)
+            downloaded += len(chunk)
 
-        print("Download complete.")
+            if total:
 
-    except KeyboardInterrupt:
+                percent = (
+                    downloaded
+                    / total
+                    * 100
+                )
 
-        print()
-        print("Download interrupted.")
-        print(f"Partial file kept at: {temp_path}")
-        print("Run the script again to resume.")
+                print(
+                    f"\r"
+                    f"{human_size(downloaded)} / "
+                    f"{human_size(total)} "
+                    f"({percent:.1f}%)",
+                    end="",
+                    flush=True,
+                )
 
-        raise
+            else:
 
+                print(
+                    f"\r"
+                    f"{human_size(downloaded)}",
+                    end="",
+                    flush=True,
+                )
+
+    print()
+
+    temp.replace(destination)
+
+    print("Download complete.")
+
+
+# ------------------------------------------------------------
+# Main
+# ------------------------------------------------------------
 
 def main():
 
-    parser = argparse.ArgumentParser(
-        description="Download models required by a ComfyUI workflow."
-    )
+    parser = argparse.ArgumentParser()
 
     parser.add_argument(
         "workflow",
-        help="ComfyUI workflow JSON file",
+        help="ComfyUI workflow JSON",
     )
 
     parser.add_argument(
         "--comfyui",
         default=".",
-        help="ComfyUI root directory (default: current directory)",
+        help="ComfyUI root directory",
     )
 
     parser.add_argument(
         "--list",
         action="store_true",
-        help="Only list required models",
     )
 
     args = parser.parse_args()
 
-    workflow_path = Path(args.workflow).expanduser().resolve()
-    comfyui_dir = Path(args.comfyui).expanduser().resolve()
+    workflow_path = Path(
+        args.workflow
+    ).resolve()
 
-    models_root = comfyui_dir / "models"
+    comfyui = Path(
+        args.comfyui
+    ).resolve()
 
-    if not workflow_path.exists():
-        print(f"Workflow not found: {workflow_path}")
-        sys.exit(1)
+    models_root = comfyui / "models"
 
-    if not models_root.exists():
-        print(f"ComfyUI models directory not found:")
-        print(models_root)
-        sys.exit(1)
+    with open(
+        workflow_path,
+        encoding="utf-8",
+    ) as f:
 
-    with open(workflow_path, "r", encoding="utf-8") as f:
         workflow = json.load(f)
 
-    models = find_models(workflow)
+    required = extract_required_models(
+        workflow
+    )
 
-    if not models:
-        print("No downloadable model metadata found in workflow.")
-        print()
-        print("Expected metadata:")
-        print("""
-"properties": {
-    "models": [
-        {
-            "name": "model.safetensors",
-            "url": "https://...",
-            "directory": "diffusion_models"
-        }
-    ]
-}
-""")
-        sys.exit(0)
+    metadata = extract_metadata_models(
+        workflow
+    )
+
+    markdown_links = extract_markdown_links(
+        workflow
+    )
+
+    attach_urls(
+        required,
+        metadata,
+        markdown_links,
+    )
 
     print()
-    print(f"Found {len(models)} model(s):")
+    print(
+        f"Required models: "
+        f"{len(required)}"
+    )
     print()
 
     missing = []
 
-    for model in models.values():
+    for model in required.values():
 
-        directory = model["directory"]
-
-        # Some official workflows use:
-        #
-        #   "directory": "models/checkpoints"
-        #
-        # while others use:
-        #
-        #   "directory": "checkpoints"
-        #
-        # Normalize both.
-
-        directory_path = Path(directory)
-
-        if (
-            directory_path.parts
-            and directory_path.parts[0] == "models"
-        ):
-            directory_path = Path(*directory_path.parts[1:])
-
-        target = models_root / directory_path / model["name"]
+        target = target_path(
+            models_root,
+            model,
+        )
 
         exists = target.exists()
 
-        status = "OK" if exists else "MISSING"
+        status = (
+            "OK"
+            if exists
+            else "MISSING"
+        )
 
-        print(f"[{status}] {model['name']}")
-        print(f"         directory: {directory}")
-        print(f"         path:      {target}")
-        print(f"         url:       {model['url']}")
+        print(
+            f"[{status}] "
+            f"{model['name']}"
+        )
+
+        print(
+            f"    node: "
+            f"{model['node_type']} "
+            f"(id={model['node_id']})"
+        )
+
+        print(
+            f"    path: {target}"
+        )
+
+        if model["url"]:
+
+            print(
+                f"    url: "
+                f"{model['url']}"
+            )
+
+            print(
+                f"    source: "
+                f"{model['url_source']}"
+            )
+
+        else:
+
+            print(
+                "    url: NOT FOUND"
+            )
+
         print()
 
         if not exists:
-            missing.append((model, target))
+            missing.append(
+                (model, target)
+            )
 
     if args.list:
         return
 
-    if not missing:
+    downloadable = [
+        x
+        for x in missing
+        if x[0]["url"]
+    ]
 
-        print("All required models are already installed.")
+    unresolved = [
+        x
+        for x in missing
+        if not x[0]["url"]
+    ]
+
+    if unresolved:
+
+        print("=" * 70)
+        print(
+            "Missing models with no "
+            "download URL:"
+        )
+        print("=" * 70)
+
+        for model, target in unresolved:
+
+            print(
+                f"- {model['name']}"
+            )
+
+            print(
+                f"  node: "
+                f"{model['node_type']}"
+            )
+
+            print(
+                f"  expected: {target}"
+            )
+
+        print()
+
+    if not downloadable:
+
+        print(
+            "No downloadable missing "
+            "models found."
+        )
+
         return
 
     print("=" * 70)
-    print(f"{len(missing)} model(s) need to be downloaded.")
+
+    print(
+        f"Downloading "
+        f"{len(downloadable)} model(s)"
+    )
+
     print("=" * 70)
 
-    for index, (model, target) in enumerate(missing, 1):
+    for i, (model, target) in enumerate(
+        downloadable,
+        1,
+    ):
 
         print()
+
         print(
-            f"[{index}/{len(missing)}] "
+            f"[{i}/{len(downloadable)}] "
             f"{model['name']}"
         )
-        print("-" * 70)
 
         try:
+
             download(
                 model["url"],
                 target,
             )
 
         except KeyboardInterrupt:
+
+            print()
+            print(
+                "Interrupted. Partial "
+                "download kept."
+            )
+
             sys.exit(130)
 
         except Exception as e:
+
             print()
-            print(f"ERROR: {e}")
-            print()
-            print("Skipping this model.")
+            print(
+                f"ERROR: {e}"
+            )
 
     print()
-    print("=" * 70)
     print("Finished.")
-    print("=" * 70)
 
 
 if __name__ == "__main__":
