@@ -16,3 +16,6 @@ python -m pip install -r requirements.txt
 
 python -m pip install -r manager_requirements.txt
 
+
+python download_workflow_models.py moodyKrea24KHD_v20.json --list
+
