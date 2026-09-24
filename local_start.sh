@@ -9,7 +9,7 @@ cleanup() {
     cleaned=1
 
     echo
-    echo "Cleaning up ComfyUI input/output images..."
+    echo "Cleaning up ComfyUI input/output images and videos..."
 
     find "$PWD/input" "$PWD/output" \
         -type f \
@@ -17,7 +17,12 @@ cleanup() {
         -o -iname "*.jpg" \
         -o -iname "*.jpeg" \
         -o -iname "*.webp" \
-        -o -iname "*.gif" \) \
+        -o -iname "*.gif" \
+        -o -iname "*.mp4" \
+        -o -iname "*.webm" \
+        -o -iname "*.mov" \
+        -o -iname "*.avi" \
+        -o -iname "*.mkv" \) \
         -print \
         -delete
 
