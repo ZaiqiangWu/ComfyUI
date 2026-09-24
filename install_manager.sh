@@ -8,12 +8,20 @@ MANAGER_DIR="$CUSTOM_NODES_DIR/ComfyUI-Manager"
 mkdir -p "$CUSTOM_NODES_DIR"
 
 if [ -d "$MANAGER_DIR/.git" ]; then
-    echo "ComfyUI-Manager 已存在，正在更新..."
+    echo "ComfyUI-Manager already exists. Updating..."
     git -C "$MANAGER_DIR" pull
 else
-    echo "正在安装 ComfyUI-Manager..."
+    echo "Installing ComfyUI-Manager..."
     git clone https://github.com/Comfy-Org/ComfyUI-Manager.git "$MANAGER_DIR"
 fi
 
-echo "完成：$MANAGER_DIR"
-echo "请重启 ComfyUI。"
+echo "Installing ComfyUI Manager dependencies..."
+
+python -m pip install -r "$COMFYUI_DIR/manager_requirements.txt"
+
+if [ -f "$MANAGER_DIR/requirements.txt" ]; then
+    python -m pip install -r "$MANAGER_DIR/requirements.txt"
+fi
+
+echo "ComfyUI-Manager installation complete."
+echo "Please restart ComfyUI."
