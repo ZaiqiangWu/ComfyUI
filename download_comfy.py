@@ -14,16 +14,30 @@ COMFYUI_PATH = Path(__file__).resolve().parent
 
 MODEL_DIR_MAP = {
     "checkpoints": "models/checkpoints",
+    "configs": "models/configs",
     "diffusion_models": "models/diffusion_models",
     "vae": "models/vae",
     "vae_approx": "models/vae_approx",
     "clip": "models/clip",
     "text_encoders": "models/text_encoders",
     "clip_vision": "models/clip_vision",
+    "style_models": "models/style_models",
+    "diffusers": "models/diffusers",
     "loras": "models/loras",
     "controlnet": "models/controlnet",
+    "gligen": "models/gligen",
     "upscale_models": "models/upscale_models",
+    "latent_upscale_models": "models/latent_upscale_models",
     "embeddings": "models/embeddings",
+    "hypernetworks": "models/hypernetworks",
+    "photomaker": "models/photomaker",
+    "model_patches": "models/model_patches",
+    "audio_encoders": "models/audio_encoders",
+    "background_removal": "models/background_removal",
+    "frame_interpolation": "models/frame_interpolation",
+    "geometry_estimation": "models/geometry_estimation",
+    "optical_flow": "models/optical_flow",
+    "detection": "models/detection",
 }
 
 
